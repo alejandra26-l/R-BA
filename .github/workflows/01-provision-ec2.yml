@@ -1,0 +1,166 @@
+
+name: 01 - Provision EC2
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Servidor que se va a aprovisionar"
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+
+jobs:
+  provision:
+    name: Provision server
+    runs-on: ubuntu-latest
+
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Install and configure server
+        uses: appleboy/ssh-action@v1
+        env:
+          MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          FLASK_SECRET_KEY: ${{ secrets.FLASK_SECRET_KEY }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: MYSQL_ROOT_PASSWORD,DB_NAME,DB_USER,DB_PASSWORD,FLASK_SECRET_KEY
+          script: |
+            set -e
+
+            echo "===== 1. Actualizando sistema ====="
+            sudo apt-get update
+
+            echo "===== 2. Instalando paquetes ====="
+            sudo apt-get install -y \
+              python3 \
+              python3-pip \
+              python3-venv \
+              mysql-server \
+              nginx \
+              ufw \
+              git
+
+            echo "===== 3. Iniciando servicios ====="
+            sudo systemctl enable mysql
+            sudo systemctl enable nginx
+
+            sudo systemctl start mysql
+            sudo systemctl start nginx
+
+            echo "===== 4. Configurando base de datos ====="
+            sudo mysql <<SQL
+            CREATE DATABASE IF NOT EXISTS ${DB_NAME};
+
+            CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost'
+            IDENTIFIED BY '${DB_PASSWORD}';
+
+            ALTER USER '${DB_USER}'@'localhost'
+            IDENTIFIED BY '${DB_PASSWORD}';
+
+            GRANT ALL PRIVILEGES ON ${DB_NAME}.*
+            TO '${DB_USER}'@'localhost';
+
+            ALTER USER 'root'@'localhost'
+            IDENTIFIED WITH caching_sha2_password
+            BY '${MYSQL_ROOT_PASSWORD}';
+
+            FLUSH PRIVILEGES;
+            SQL
+
+            echo "===== 5. Creando estructura de carpetas ====="
+            sudo mkdir -p /opt/flaskapp/current
+            sudo mkdir -p /opt/flaskapp/backups
+            sudo mkdir -p /opt/flaskapp/logs
+
+            sudo chown -R ubuntu:ubuntu /opt/flaskapp
+
+            echo "===== 6. Creando entorno virtual ====="
+            sudo python3 -m venv /opt/flaskapp/venv
+
+            echo "===== 7. Instalando Gunicorn ====="
+            sudo -u ubuntu /opt/flaskapp/venv/bin/pip install gunicorn
+
+            echo "===== 8. Creando archivo .env ====="
+            sudo tee /opt/flaskapp/.env > /dev/null <<ENV
+            SECRET_KEY=${FLASK_SECRET_KEY}
+            MYSQL_USER=${DB_USER}
+            MYSQL_PASSWORD=${DB_PASSWORD}
+            MYSQL_HOST=127.0.0.1
+            MYSQL_PORT=3306
+            MYSQL_DATABASE=${DB_NAME}
+            ENV
+
+            sudo chown ubuntu:ubuntu /opt/flaskapp/.env
+            sudo chmod 600 /opt/flaskapp/.env
+
+            echo "===== 9. Creando servicio Flask ====="
+            sudo tee /etc/systemd/system/flaskapp.service > /dev/null <<SERVICE
+            [Unit]
+            Description=RentStyle Flask Application
+            After=network.target mysql.service
+
+            [Service]
+            User=ubuntu
+            Group=ubuntu
+            WorkingDirectory=/opt/flaskapp/current
+            EnvironmentFile=/opt/flaskapp/.env
+            ExecStart=/opt/flaskapp/venv/bin/gunicorn --workers 2 --bind 127.0.0.1:5000 wsgi:app
+            Restart=always
+
+            [Install]
+            WantedBy=multi-user.target
+            SERVICE
+
+            sudo systemctl daemon-reload
+            sudo systemctl enable flaskapp
+
+            echo "===== 10. Configurando Nginx ====="
+            sudo tee /etc/nginx/sites-available/flaskapp > /dev/null <<'NGINX'
+            server {
+                listen 80;
+                server_name _;
+
+                location / {
+                    proxy_pass http://127.0.0.1:5000;
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                }
+            }
+            NGINX
+
+            sudo rm -f /etc/nginx/sites-enabled/default
+
+            sudo ln -sf /etc/nginx/sites-available/flaskapp \
+              /etc/nginx/sites-enabled/flaskapp
+
+            echo "===== 11. Validando Nginx ====="
+            sudo nginx -t
+            sudo systemctl reload nginx
+
+            echo "===== 12. Configurando firewall ====="
+            sudo ufw allow OpenSSH
+            sudo ufw allow 80/tcp
+            sudo ufw allow 443/tcp
+            sudo ufw --force enable
+
+            echo "===== 13. Verificando MySQL ====="
+            sudo systemctl status mysql --no-pager
+
+            echo "===== 14. Verificando Nginx ====="
+            sudo systemctl status nginx --no-pager
+
+            echo "===== 15. Verificando servicio Flask ====="
+            sudo systemctl status flaskapp --no-pager || true
+
+            echo "===== APROVISIONAMIENTO FINALIZADO ====="
